@@ -1,0 +1,71 @@
+import http from 'node:http';
+import {randomBytes,randomInt,randomUUID} from 'node:crypto';
+import {readFile} from 'node:fs/promises';
+import {fileURLToPath} from 'node:url';
+
+export function createServer({iceServers=[{urls:'stun:stun.l.google.com:19302'}],publicOrigin=null,serveMusic=true}={}) {
+ const users=new Map(),calls=new Map(),limits=new Map();
+ const json=(res,status,data)=>{res.writeHead(status,{'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store','X-Content-Type-Options':'nosniff'});res.end(JSON.stringify(data))};
+ const end=(c,reason)=>{c.state='ended';c.reason=reason;c.updated=Date.now();delete c.offer;delete c.answer};
+ function sweep(){const now=Date.now();for(const [n,u] of users)if(now-u.seen>45000){users.delete(n);for(const c of calls.values())if(c.state!=='ended'&&(c.from===n||c.to===n))end(c,'Собеседник отключился')}
+  for(const [id,c] of calls){if(c.state==='ringing'&&now-c.created>45000)end(c,'Нет ответа');if(c.state==='active'&&now-c.created>4*3600000)end(c,'Достигнут предел длительности');if(c.state==='ended'&&now-c.updated>60000)calls.delete(id)}for(const [ip,l] of limits)if(now>l.until)limits.delete(ip)}
+ const timer=setInterval(sweep,1000);timer.unref();
+ const server=http.createServer(async(req,res)=>{try{
+  const origin=publicOrigin||`http://${req.headers.host}`;
+   const allowed=new Set([origin,'https://sherbakovyan7-bit.github.io']);
+   if(req.headers.origin&&!allowed.has(req.headers.origin))return json(res,403,{error:'Запрос с другого сайта запрещён'});
+   if(req.headers.origin){res.setHeader('Access-Control-Allow-Origin',req.headers.origin);res.setHeader('Vary','Origin');}
+   if(req.method==='OPTIONS'){res.writeHead(204,{'Access-Control-Allow-Methods':'GET, POST, OPTIONS','Access-Control-Allow-Headers':'Content-Type, Authorization','Access-Control-Max-Age':'600'});return res.end();}
+   const path=new URL(req.url,'http://localhost').pathname;
+   if(path==='/connection.js'&&req.method==='GET'){res.writeHead(200,{'Content-Type':'text/javascript; charset=utf-8','Cache-Control':'no-cache'});return res.end(await readFile(new URL('./connection.js',import.meta.url)));}
+  const files={'/':['index.html','text/html; charset=utf-8'],'/mail.css':['mail.css','text/css'],'/mail.js':['mail.js','text/javascript'],'/voice.js':['voice.js','text/javascript'],["/Jack%20Stauber's%20Micropop%20-%20Baby%20Hotline.mp3"]:["Jack Stauber's Micropop - Baby Hotline.mp3",'audio/mpeg']};
+  if(req.method==='GET'&&files[path]){const [file,type]=files[path];if(type==='audio/mpeg'&&!serveMusic)return json(res,404,{error:'Локальный трек не публикуется'});const contents=await readFile(new URL(file,import.meta.url));res.writeHead(200,{'Content-Type':type,'Cache-Control':'no-cache','X-Content-Type-Options':'nosniff'});return res.end(contents)}
+  if(path==='/api/config'&&req.method==='GET')return json(res,200,{iceServers});
+  if(path==='/api/health'&&req.method==='GET')return json(res,200,{app:'baby-hotline',ok:true});
+  sweep();let body={};
+  if(req.method==='POST'){
+   if(!req.headers['content-type']?.startsWith('application/json'))return json(res,415,{error:'Нужен JSON'});
+   let raw='';for await(const chunk of req){raw+=chunk;if(Buffer.byteLength(raw)>30000)return json(res,413,{error:'Слишком большой запрос'})}
+   try{body=JSON.parse(raw)}catch{return json(res,400,{error:'Некорректный JSON'})}
+   if(!body||typeof body!=='object'||Array.isArray(body))return json(res,400,{error:'Нужен объект'});
+  }
+  if(path==='/api/register'&&req.method==='POST'){
+   const ip=req.socket.remoteAddress;const l=limits.get(ip)||{count:0,until:Date.now()+60000};limits.set(ip,l);
+   if(++l.count>20||users.size>=200)return json(res,429,{error:'Слишком много регистраций, подождите минуту'});
+   let number;do{number=String(randomInt(100000,1000000))}while(users.has(number));
+   const u={number,token:randomBytes(32).toString('hex'),seen:Date.now(),attempts:[]};users.set(number,u);return json(res,201,{number,token:u.token});
+  }
+  const token=(req.headers.authorization||'').replace(/^Bearer /,'');
+  const user=[...users.values()].find(u=>u.token===token);
+  if(!user)return json(res,401,{error:'Линия отключена. Подключитесь снова.'});
+  user.seen=Date.now();
+  const visible=c=>({id:c.id,from:c.from,to:c.to,state:c.state,reason:c.reason||null,offer:user.number===c.to?c.offer:null,answer:user.number===c.from?c.answer:null});
+  if(path==='/api/poll'&&req.method==='GET')return json(res,200,{calls:[...calls.values()].filter(c=>c.from===user.number||c.to===user.number).map(visible)});
+  if(path==='/api/call'&&req.method==='POST'){
+   user.attempts=user.attempts.filter(t=>Date.now()-t<60000);if(user.attempts.length>=10)return json(res,429,{error:'Слишком много вызовов. Подождите минуту.'});user.attempts.push(Date.now());
+   const target=users.get(String(body.number));if(!target)return json(res,404,{error:'Номер не в сети'});
+   if(target===user)return json(res,400,{error:'Нельзя позвонить самому себе'});
+   if([...calls.values()].some(c=>c.state!=='ended'&&[c.from,c.to].some(n=>n===user.number||n===target.number)))return json(res,409,{error:'Линия занята'});
+   if(body.offer?.type!=='offer'||typeof body.offer.sdp!=='string'||body.offer.sdp.length>20000)return json(res,400,{error:'Нет предложения голосового соединения'});
+   const c={id:randomUUID(),from:user.number,to:target.number,state:'ringing',offer:body.offer,created:Date.now(),updated:Date.now()};calls.set(c.id,c);return json(res,201,visible(c));
+  }
+  const match=path.match(/^\/api\/call\/([^/]+)\/(answer|end)$/);
+  if(match&&req.method==='POST'){
+   const c=calls.get(match[1]);if(!c||![c.from,c.to].includes(user.number))return json(res,403,{error:'Нет доступа к звонку'});
+   if(match[2]==='end'){end(c,'Звонок завершён');return json(res,200,visible(c))}
+   if(c.to!==user.number)return json(res,403,{error:'Принять может только получатель'});
+   if(c.state!=='ringing')return json(res,409,{error:'Вызов уже завершён или принят'});
+   if(body.answer?.type!=='answer'||typeof body.answer.sdp!=='string'||body.answer.sdp.length>20000)return json(res,400,{error:'Нет ответа голосового соединения'});
+   c.answer=body.answer;c.state='active';return json(res,200,visible(c));
+  }
+  json(res,404,{error:'Маршрут не найден'});
+ }catch(e){if(!res.headersSent)json(res,500,{error:'Ошибка сервера'});else res.end();console.error(e.message)}});
+ server.on('close',()=>clearInterval(timer));return server;
+}
+if(process.argv[1]===fileURLToPath(import.meta.url)){
+ const iceServers=[{urls:'stun:stun.l.google.com:19302'}];
+ if(process.env.TURN_URL&&process.env.TURN_USERNAME&&process.env.TURN_PASSWORD)iceServers.push({urls:process.env.TURN_URL,username:process.env.TURN_USERNAME,credential:process.env.TURN_PASSWORD});
+ const server=createServer({iceServers,publicOrigin:process.env.PUBLIC_ORIGIN,serveMusic:process.env.SERVE_MUSIC!=='false'});
+ server.on('error',e=>{console.error(e.message);process.exitCode=1});
+ server.listen(Number(process.env.PORT||3001),process.env.HOST||'127.0.0.1',()=>console.log('Baby Hotline: http://localhost:'+ (process.env.PORT||3001)));
+}
