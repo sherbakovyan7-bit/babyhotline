@@ -47,6 +47,18 @@ export function createServer({iceServers=[{urls:'stun:stun.l.google.com:19302'}]
   const user=[...users.values()].find(u=>u.token===token);
   if(!user)return json(res,401,{error:'Линия отключена. Подключитесь снова.'});
   user.seen=Date.now();
+  if(path==='/api/number'&&req.method==='POST'){
+   const number=body.number;
+   if(typeof number!=='string'||! /^[1-9][0-9]{5}$/.test(number))return json(res,400,{error:'Нужны 6 цифр, первая — не ноль.'});
+   if(number===user.number)return json(res,200,{number,token:user.token});
+   if(accounts.has(number))return json(res,409,{error:'Этот номер занят. Выбери другой.'});
+   if([...calls.values()].some(c=>c.state!=='ended'&&[c.from,c.to].includes(user.number)))return json(res,409,{error:'Сначала заверши звонок.'});
+   const old=user.number,account=accounts.get(old);
+   accounts.delete(old);accounts.set(number,{number,token:user.token});
+   try{saveAccounts()}catch(e){accounts.delete(number);accounts.set(old,account);throw e}
+   users.delete(old);user.number=number;users.set(number,user);
+   return json(res,200,{number,token:user.token});
+  }
   if(path==='/api/messages'&&req.method==='GET')return json(res,200,{messages:user.messages||[]});
   if(path==='/api/messages'&&req.method==='POST'){
    if(typeof body.text!=='string'||!body.text.trim()||body.text.length>2000||typeof body.name!=='string'||!body.name.trim()||body.name.length>40)return json(res,400,{error:'Укажи ник до 40 символов и сообщение до 2000 символов'});
