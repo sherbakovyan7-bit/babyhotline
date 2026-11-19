@@ -17,6 +17,7 @@ export function createServer({iceServers=[{urls:'stun:stun.l.google.com:19302'}]
    if(req.headers.origin){res.setHeader('Access-Control-Allow-Origin',req.headers.origin);res.setHeader('Vary','Origin');}
    if(req.method==='OPTIONS'){res.writeHead(204,{'Access-Control-Allow-Methods':'GET, POST, OPTIONS','Access-Control-Allow-Headers':'Content-Type, Authorization','Access-Control-Max-Age':'600'});return res.end();}
    const path=new URL(req.url,'http://localhost').pathname;
+   if(path==='/chat.js'&&req.method==='GET'){res.writeHead(200,{'Content-Type':'text/javascript; charset=utf-8','Cache-Control':'no-cache'});return res.end(await readFile(new URL('./chat.js',import.meta.url)));}
    if(path==='/connection.js'&&req.method==='GET'){res.writeHead(200,{'Content-Type':'text/javascript; charset=utf-8','Cache-Control':'no-cache'});return res.end(await readFile(new URL('./connection.js',import.meta.url)));}
   const files={'/':['index.html','text/html; charset=utf-8'],'/mail.css':['mail.css','text/css'],'/mail.js':['mail.js','text/javascript'],'/voice.js':['voice.js','text/javascript'],["/Jack%20Stauber's%20Micropop%20-%20Baby%20Hotline.mp3"]:["Jack Stauber's Micropop - Baby Hotline.mp3",'audio/mpeg']};
   if(req.method==='GET'&&files[path]){const [file,type]=files[path];if(type==='audio/mpeg'&&!serveMusic)return json(res,404,{error:'Локальный трек не публикуется'});const contents=await readFile(new URL(file,import.meta.url));res.writeHead(200,{'Content-Type':type,'Cache-Control':'no-cache','X-Content-Type-Options':'nosniff'});return res.end(contents)}
@@ -39,6 +40,14 @@ export function createServer({iceServers=[{urls:'stun:stun.l.google.com:19302'}]
   const user=[...users.values()].find(u=>u.token===token);
   if(!user)return json(res,401,{error:'Линия отключена. Подключитесь снова.'});
   user.seen=Date.now();
+  if(path==='/api/messages'&&req.method==='GET')return json(res,200,{messages:user.messages||[]});
+  if(path==='/api/messages'&&req.method==='POST'){
+   if(typeof body.text!=='string'||!body.text.trim()||body.text.length>2000||typeof body.name!=='string'||!body.name.trim()||body.name.length>40)return json(res,400,{error:'Укажи ник до 40 символов и сообщение до 2000 символов'});
+   const target=users.get(String(body.to));if(!target)return json(res,404,{error:'Друг не в сети. Попроси его подключиться и проверить номер.'});
+   user.mailTimes=(user.mailTimes||[]).filter(t=>Date.now()-t<60000);if(user.mailTimes.length>=30)return json(res,429,{error:'Слишком много сообщений. Подожди минуту.'});user.mailTimes.push(Date.now());
+   const msg={id:randomUUID(),from:user.number,to:target.number,name:body.name.trim(),text:body.text.trim(),time:Date.now()};
+   target.messages=[...(target.messages||[]),msg].slice(-100);return json(res,201,{message:msg});
+  }
   const visible=c=>({id:c.id,from:c.from,to:c.to,state:c.state,reason:c.reason||null,offer:user.number===c.to?c.offer:null,answer:user.number===c.from?c.answer:null});
   if(path==='/api/poll'&&req.method==='GET')return json(res,200,{calls:[...calls.values()].filter(c=>c.from===user.number||c.to===user.number).map(visible)});
   if(path==='/api/call'&&req.method==='POST'){
