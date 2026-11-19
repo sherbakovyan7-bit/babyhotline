@@ -22,6 +22,7 @@ export function createServer({iceServers=[{urls:'stun:stun.l.google.com:19302'}]
    if(req.headers.origin){res.setHeader('Access-Control-Allow-Origin',req.headers.origin);res.setHeader('Vary','Origin');}
    if(req.method==='OPTIONS'){res.writeHead(204,{'Access-Control-Allow-Methods':'GET, POST, OPTIONS','Access-Control-Allow-Headers':'Content-Type, Authorization','Access-Control-Max-Age':'600'});return res.end();}
    const path=new URL(req.url,'http://localhost').pathname;
+   if(path==='/ringtone.mp3'&&req.method==='GET'){res.writeHead(200,{'Content-Type':'audio/mpeg','Cache-Control':'no-cache'});return res.end(await readFile(new URL('./ringtone.mp3',import.meta.url)));}
    if(path==='/ringer.js'&&req.method==='GET'){res.writeHead(200,{'Content-Type':'text/javascript; charset=utf-8','Cache-Control':'no-cache'});return res.end(await readFile(new URL('./ringer.js',import.meta.url)));}
    if(path==='/chat.js'&&req.method==='GET'){res.writeHead(200,{'Content-Type':'text/javascript; charset=utf-8','Cache-Control':'no-cache'});return res.end(await readFile(new URL('./chat.js',import.meta.url)));}
    if(path==='/connection.js'&&req.method==='GET'){res.writeHead(200,{'Content-Type':'text/javascript; charset=utf-8','Cache-Control':'no-cache'});return res.end(await readFile(new URL('./connection.js',import.meta.url)));}
