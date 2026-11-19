@@ -2,9 +2,14 @@ import http from 'node:http';
 import {randomBytes,randomInt,randomUUID} from 'node:crypto';
 import {readFile} from 'node:fs/promises';
 import {fileURLToPath} from 'node:url';
+import {readFileSync,writeFileSync,renameSync,mkdirSync} from 'node:fs';
+import {dirname,resolve} from 'node:path';
 
-export function createServer({iceServers=[{urls:'stun:stun.l.google.com:19302'}],publicOrigin=null,serveMusic=true}={}) {
+export function createServer({iceServers=[{urls:'stun:stun.l.google.com:19302'}],publicOrigin=null,serveMusic=true,accountsFile=null}={}) {
  const users=new Map(),calls=new Map(),limits=new Map();
+ const accounts=new Map();
+ if(accountsFile){try{const saved=JSON.parse(readFileSync(accountsFile,'utf8'));if(!Array.isArray(saved))throw Error('Invalid accounts file');for(const a of saved){if(!/^\d{6}$/.test(a.number)||!/^\w{64}$/.test(a.token)||accounts.has(a.number))throw Error('Invalid account');accounts.set(a.number,a)}}catch(e){if(e.code!=='ENOENT')throw e;}}
+ function saveAccounts(){if(!accountsFile)return;mkdirSync(dirname(accountsFile),{recursive:true});writeFileSync(accountsFile+'.tmp',JSON.stringify([...accounts.values()]),{mode:0o600});renameSync(accountsFile+'.tmp',accountsFile);}
  const json=(res,status,data)=>{res.writeHead(status,{'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store','X-Content-Type-Options':'nosniff'});res.end(JSON.stringify(data))};
  const end=(c,reason)=>{c.state='ended';c.reason=reason;c.updated=Date.now();delete c.offer;delete c.answer};
  function sweep(){const now=Date.now();for(const [n,u] of users)if(now-u.seen>45000){users.delete(n);for(const c of calls.values())if(c.state!=='ended'&&(c.from===n||c.to===n))end(c,'Собеседник отключился')}
@@ -31,10 +36,12 @@ export function createServer({iceServers=[{urls:'stun:stun.l.google.com:19302'}]
    if(!body||typeof body!=='object'||Array.isArray(body))return json(res,400,{error:'Нужен объект'});
   }
   if(path==='/api/register'&&req.method==='POST'){
+   if(body.token!==undefined){const account=[...accounts.values()].find(a=>a.token===body.token);if(!account)return json(res,401,{error:'Ключ номера не найден на этом сервере. Проверь адрес сервера; сохранённый номер не заменён.'});let u=users.get(account.number);if(!u){u={...account,seen:Date.now(),attempts:[]};users.set(u.number,u)}u.seen=Date.now();return json(res,200,{number:u.number,token:u.token});}
    const ip=req.socket.remoteAddress;const l=limits.get(ip)||{count:0,until:Date.now()+60000};limits.set(ip,l);
    if(++l.count>20||users.size>=200)return json(res,429,{error:'Слишком много регистраций, подождите минуту'});
-   let number;do{number=String(randomInt(100000,1000000))}while(users.has(number));
-   const u={number,token:randomBytes(32).toString('hex'),seen:Date.now(),attempts:[]};users.set(number,u);return json(res,201,{number,token:u.token});
+   if(accounts.size>=900000)return json(res,503,{error:'Свободных номеров нет'});
+   let number;do{number=String(randomInt(100000,1000000))}while(accounts.has(number));
+   const u={number,token:randomBytes(32).toString('hex'),seen:Date.now(),attempts:[]};accounts.set(number,{number,token:u.token});try{saveAccounts()}catch(e){accounts.delete(number);throw e}users.set(number,u);return json(res,201,{number,token:u.token});
   }
   const token=(req.headers.authorization||'').replace(/^Bearer /,'');
   const user=[...users.values()].find(u=>u.token===token);
@@ -74,7 +81,7 @@ export function createServer({iceServers=[{urls:'stun:stun.l.google.com:19302'}]
 if(process.argv[1]===fileURLToPath(import.meta.url)){
  const iceServers=[{urls:'stun:stun.l.google.com:19302'}];
  if(process.env.TURN_URL&&process.env.TURN_USERNAME&&process.env.TURN_PASSWORD)iceServers.push({urls:process.env.TURN_URL,username:process.env.TURN_USERNAME,credential:process.env.TURN_PASSWORD});
- const server=createServer({iceServers,publicOrigin:process.env.PUBLIC_ORIGIN,serveMusic:process.env.SERVE_MUSIC!=='false'});
+  const server=createServer({iceServers,publicOrigin:process.env.PUBLIC_ORIGIN,serveMusic:process.env.SERVE_MUSIC!=='false',accountsFile:resolve(process.env.ACCOUNTS_FILE||fileURLToPath(new URL('./data/accounts.json',import.meta.url)))});
  server.on('error',e=>{console.error(e.message);process.exitCode=1});
  server.listen(Number(process.env.PORT||3001),process.env.HOST||'127.0.0.1',()=>console.log('Baby Hotline: http://localhost:'+ (process.env.PORT||3001)));
 }
