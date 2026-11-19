@@ -8,6 +8,8 @@ import {dirname,resolve} from 'node:path';
 export function createServer({iceServers=[{urls:'stun:stun.l.google.com:19302'}],publicOrigin=null,serveMusic=true,accountsFile=null}={}) {
  const users=new Map(),calls=new Map(),limits=new Map();
  const accounts=new Map();
+ const logins=new Map(),loginLimits=new Map();
+ function limited(key,max){const now=Date.now();for(const [k,v] of loginLimits)if(v.until<now)loginLimits.delete(k);const v=loginLimits.get(key)||{count:0,until:now+60000};loginLimits.set(key,v);return ++v.count>max;}
  if(accountsFile){try{const saved=JSON.parse(readFileSync(accountsFile,'utf8'));if(!Array.isArray(saved))throw Error('Invalid accounts file');for(const a of saved){if(!/^\d{6}$/.test(a.number)||!/^\w{64}$/.test(a.token)||accounts.has(a.number))throw Error('Invalid account');accounts.set(a.number,a)}}catch(e){if(e.code!=='ENOENT')throw e;}}
  function saveAccounts(){if(!accountsFile)return;mkdirSync(dirname(accountsFile),{recursive:true});writeFileSync(accountsFile+'.tmp',JSON.stringify([...accounts.values()]),{mode:0o600});renameSync(accountsFile+'.tmp',accountsFile);}
  const json=(res,status,data)=>{res.writeHead(status,{'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store','X-Content-Type-Options':'nosniff'});res.end(JSON.stringify(data))};
@@ -22,6 +24,7 @@ export function createServer({iceServers=[{urls:'stun:stun.l.google.com:19302'}]
    if(req.headers.origin){res.setHeader('Access-Control-Allow-Origin',req.headers.origin);res.setHeader('Vary','Origin');}
    if(req.method==='OPTIONS'){res.writeHead(204,{'Access-Control-Allow-Methods':'GET, POST, OPTIONS','Access-Control-Allow-Headers':'Content-Type, Authorization','Access-Control-Max-Age':'600'});return res.end();}
    const path=new URL(req.url,'http://localhost').pathname;
+   if(path==='/account.js'&&req.method==='GET'){res.writeHead(200,{'Content-Type':'text/javascript; charset=utf-8','Cache-Control':'no-cache'});return res.end(await readFile(new URL('./account.js',import.meta.url)));}
    if(path==='/ringtone.mp3'&&req.method==='GET'){res.writeHead(200,{'Content-Type':'audio/mpeg','Cache-Control':'no-cache'});return res.end(await readFile(new URL('./ringtone.mp3',import.meta.url)));}
    if(path==='/ringer.js'&&req.method==='GET'){res.writeHead(200,{'Content-Type':'text/javascript; charset=utf-8','Cache-Control':'no-cache'});return res.end(await readFile(new URL('./ringer.js',import.meta.url)));}
    if(path==='/chat.js'&&req.method==='GET'){res.writeHead(200,{'Content-Type':'text/javascript; charset=utf-8','Cache-Control':'no-cache'});return res.end(await readFile(new URL('./chat.js',import.meta.url)));}
@@ -37,29 +40,37 @@ export function createServer({iceServers=[{urls:'stun:stun.l.google.com:19302'}]
    try{body=JSON.parse(raw)}catch{return json(res,400,{error:'Некорректный JSON'})}
    if(!body||typeof body!=='object'||Array.isArray(body))return json(res,400,{error:'Нужен объект'});
   }
-  if(path==='/api/register'&&req.method==='POST'){
+   for(const [id,l] of logins)if(l.expires<Date.now())logins.delete(id);
+   if(path==='/api/login/request'&&req.method==='POST'){
+    if(limited('ip:'+req.socket.remoteAddress,10)||limited('number:'+String(body.number),2))return json(res,429,{error:'Подожди минуту перед следующим звонком.'});
+    if(!users.has(body.number))return json(res,404,{error:'Открой приложение и подключись на устройстве, где уже выполнен вход.'});
+    if([...logins.values()].some(l=>l.number===body.number))return json(res,409,{error:'Звонок для входа уже ожидает ответа.'});
+    const id=randomUUID();logins.set(id,{number:body.number,code:String(randomInt(100000,1000000)),expires:Date.now()+180000,attempts:0,accepted:false});return json(res,201,{id});
+   }
+   if(path==='/api/login/verify'&&req.method==='POST'){
+    if(limited('verify:'+req.socket.remoteAddress,30))return json(res,429,{error:'Слишком много попыток.'});
+    const l=logins.get(body.id);if(!l)return json(res,400,{error:'Код истёк или уже использован.'});
+    if(++l.attempts>5){logins.delete(body.id);return json(res,429,{error:'Попытки закончились. Запроси новый звонок.'});}
+    if(!l.accepted||body.code!==l.code)return json(res,400,{error:'Неверный код или звонок ещё не принят.'});
+    logins.delete(body.id);const a=accounts.get(l.number);return json(res,200,{number:a.number,token:a.token});
+   }
+   if(path==='/api/register'&&req.method==='POST'){
    if(body.token!==undefined){const account=[...accounts.values()].find(a=>a.token===body.token);if(!account)return json(res,401,{error:'Ключ номера не найден на этом сервере. Проверь адрес сервера; сохранённый номер не заменён.'});let u=users.get(account.number);if(!u){u={...account,seen:Date.now(),attempts:[]};users.set(u.number,u)}u.seen=Date.now();return json(res,200,{number:u.number,token:u.token});}
    const ip=req.socket.remoteAddress;const l=limits.get(ip)||{count:0,until:Date.now()+60000};limits.set(ip,l);
    if(++l.count>20||users.size>=200)return json(res,429,{error:'Слишком много регистраций, подождите минуту'});
-   if(accounts.size>=900000)return json(res,503,{error:'Свободных номеров нет'});
+    if(accounts.size>=900000)return json(res,503,{error:'Свободных номеров нет'});
+    if(![body.firstName,body.lastName].every(n=>typeof n==='string'&&n.trim()&&n.length<=60))return json(res,400,{error:'Введи имя и фамилию (до 60 символов).'});
    let number;do{number=String(randomInt(100000,1000000))}while(accounts.has(number));
-   const u={number,token:randomBytes(32).toString('hex'),seen:Date.now(),attempts:[]};accounts.set(number,{number,token:u.token});try{saveAccounts()}catch(e){accounts.delete(number);throw e}users.set(number,u);return json(res,201,{number,token:u.token});
+    const u={number,token:randomBytes(32).toString('hex'),seen:Date.now(),attempts:[]};accounts.set(number,{number,token:u.token,firstName:body.firstName.trim(),lastName:body.lastName.trim()});try{saveAccounts()}catch(e){accounts.delete(number);throw e}users.set(number,u);return json(res,201,{number,token:u.token});
   }
   const token=(req.headers.authorization||'').replace(/^Bearer /,'');
   const user=[...users.values()].find(u=>u.token===token);
   if(!user)return json(res,401,{error:'Линия отключена. Подключитесь снова.'});
   user.seen=Date.now();
+  if(path==='/api/login/pending'&&req.method==='GET')return json(res,200,{requests:[...logins].filter(([,l])=>l.number===user.number).map(([id,l])=>({id,expires:l.expires}))});
+  if(path==='/api/login/answer'&&req.method==='POST'){const l=logins.get(body.id);if(!l||l.number!==user.number)return json(res,403,{error:'Нет доступа к звонку.'});if(body.reject){logins.delete(body.id);return json(res,200,{ok:true})}l.accepted=true;return json(res,200,{code:l.code});}
   if(path==='/api/number'&&req.method==='POST'){
-   const number=body.number;
-   if(typeof number!=='string'||! /^[1-9][0-9]{5}$/.test(number))return json(res,400,{error:'Нужны 6 цифр, первая — не ноль.'});
-   if(number===user.number)return json(res,200,{number,token:user.token});
-   if(accounts.has(number))return json(res,409,{error:'Этот номер занят. Выбери другой.'});
-   if([...calls.values()].some(c=>c.state!=='ended'&&[c.from,c.to].includes(user.number)))return json(res,409,{error:'Сначала заверши звонок.'});
-   const old=user.number,account=accounts.get(old);
-   accounts.delete(old);accounts.set(number,{number,token:user.token});
-   try{saveAccounts()}catch(e){accounts.delete(number);accounts.set(old,account);throw e}
-   users.delete(old);user.number=number;users.set(number,user);
-   return json(res,200,{number,token:user.token});
+   return json(res,403,{error:'Номер аккаунта менять нельзя.'});
   }
   if(path==='/api/messages'&&req.method==='GET')return json(res,200,{messages:user.messages||[]});
   if(path==='/api/messages'&&req.method==='POST'){
